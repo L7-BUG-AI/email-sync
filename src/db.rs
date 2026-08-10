@@ -5,6 +5,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 /// 文件夹同步进度
+#[allow(dead_code)] // id/uidvalidity 供后续功能（状态展示/重置检测）使用
 #[derive(Debug, Clone)]
 pub struct FolderState {
     pub id: i64,

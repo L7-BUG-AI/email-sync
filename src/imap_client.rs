@@ -34,7 +34,7 @@ pub fn list_folders(session: &mut ImapSession) -> Result<Vec<String>> {
     Ok(names
         .into_iter()
         .filter(|n| !is_noselect(n))
-        .map(|n| decode_name(&n.name()))
+        .map(|n| n.name().to_string())
         .collect())
 }
 
@@ -45,13 +45,9 @@ fn is_noselect(name: &Name) -> bool {
         .any(|a| matches!(a, NameAttribute::NoSelect))
 }
 
-/// 解码 IMAP 文件夹名（imap crate 已处理 modified UTF-7；此处原样返回）
-fn decode_name(name: &str) -> String {
-    name.to_string()
-}
-
 /// 从 LIST 原始响应行解析文件夹名（纯逻辑，测试用）
 /// 输入示例：`* LIST (\HasNoChildren) "/" "INBOX"`
+#[allow(dead_code)] // 测试辅助，保留
 pub fn parse_list_line(line: &str) -> Option<String> {
     // 跳过 * 和 LIST
     let rest = line
