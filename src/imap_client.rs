@@ -39,10 +39,15 @@ pub fn list_folders(session: &mut ImapSession) -> Result<Vec<String>> {
 }
 
 /// 判断 Name 是否带 \Noselect 属性
+/// 注意：有的服务器发 `\NoSelect`（大写 S），会被解析成 Custom 变体，需兼容
 fn is_noselect(name: &Name) -> bool {
-    name.attributes()
-        .iter()
-        .any(|a| matches!(a, NameAttribute::NoSelect))
+    name.attributes().iter().any(|a| match a {
+        NameAttribute::NoSelect => true,
+        NameAttribute::Custom(s) => {
+            s.eq_ignore_ascii_case("\\NoSelect") || s.eq_ignore_ascii_case("\\Noselect")
+        }
+        _ => false,
+    })
 }
 
 /// 从 LIST 原始响应行解析文件夹名（纯逻辑，测试用）

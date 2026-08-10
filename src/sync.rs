@@ -35,54 +35,59 @@ pub fn sync_folder(db: &Db, session: &mut ImapSession, folder: &str) -> Result<u
         return Ok(0);
     }
 
-    // 排序后批量拉取（RFC822 = 完整原文）
+    // 排序后分批拉取（RFC822 = 完整原文）
+    // 分批避免一次拉取过多邮件导致大响应卡死（服务器慢/超大附件）
     let mut sorted: Vec<u32> = uids.into_iter().collect();
     sorted.sort_unstable();
-    let seq_set = sorted
-        .iter()
-        .map(|u| u.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
 
-    let fetches = session
-        .uid_fetch(seq_set, "RFC822")
-        .with_context(|| format!("UID FETCH 失败: {folder}"))?;
-
+    const BATCH_SIZE: usize = 50;
     let mut added = 0u32;
     let mut max_uid = last_uid;
-    for fetch in fetches.iter() {
-        let Some(uid) = fetch.uid else { continue };
-        let Some(raw) = fetch.body() else { continue };
-        let msg = match parse::parse_mail(raw) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[warn] 解析邮件失败 UID={uid} {folder}: {e}");
-                continue;
+
+    for chunk in sorted.chunks(BATCH_SIZE) {
+        let seq_set = chunk
+            .iter()
+            .map(|u| u.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches = session
+            .uid_fetch(seq_set, "RFC822")
+            .with_context(|| format!("UID FETCH 失败: {folder}"))?;
+
+        for fetch in fetches.iter() {
+            let Some(uid) = fetch.uid else { continue };
+            let Some(raw) = fetch.body() else { continue };
+            let msg = match parse::parse_mail(raw) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[warn] 解析邮件失败 UID={uid} {folder}: {e}");
+                    continue;
+                }
+            };
+            // 附件打包：zip 二进制 + 压缩包名
+            let (zip_name, zip_data) = match parse::pack(&msg) {
+                Some(p) => (Some(p.name), Some(p.data)),
+                None => (None, None),
+            };
+            let record = MailRecord {
+                folder_id,
+                uid,
+                message_id: msg.message_id.as_deref(),
+                subject: msg.subject.as_deref(),
+                from_addr: msg.from_addr.as_deref(),
+                to_addr: msg.to_addr.as_deref(),
+                date: msg.date.as_deref(),
+                body_text: msg.body_text.as_deref(),
+                body_html: msg.body_html.as_deref(),
+                zip_name: zip_name.as_deref(),
+                zip_data: zip_data.as_deref(),
+            };
+            db.insert_message(&record)?;
+            if uid > max_uid {
+                max_uid = uid;
             }
-        };
-        // 附件打包：zip 二进制 + 压缩包名
-        let (zip_name, zip_data) = match parse::pack(&msg) {
-            Some(p) => (Some(p.name), Some(p.data)),
-            None => (None, None),
-        };
-        let record = MailRecord {
-            folder_id,
-            uid,
-            message_id: msg.message_id.as_deref(),
-            subject: msg.subject.as_deref(),
-            from_addr: msg.from_addr.as_deref(),
-            to_addr: msg.to_addr.as_deref(),
-            date: msg.date.as_deref(),
-            body_text: msg.body_text.as_deref(),
-            body_html: msg.body_html.as_deref(),
-            zip_name: zip_name.as_deref(),
-            zip_data: zip_data.as_deref(),
-        };
-        db.insert_message(&record)?;
-        if uid > max_uid {
-            max_uid = uid;
+            added += 1;
         }
-        added += 1;
     }
 
     // 更新同步进度
