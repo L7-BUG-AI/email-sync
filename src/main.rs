@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod imap_client;
 
 fn main() {
     let cfg = config::Config::load(&config::default_config_path()).unwrap_or_else(|e| {
