@@ -3,6 +3,7 @@ mod db;
 mod imap_client;
 mod attach;
 mod parse;
+mod sync;
 
 fn main() {
     let cfg = config::Config::load(&config::default_config_path()).unwrap_or_else(|e| {
