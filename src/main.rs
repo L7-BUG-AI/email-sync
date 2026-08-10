@@ -1,4 +1,5 @@
 mod config;
+mod db;
 
 fn main() {
     let cfg = config::Config::load(&config::default_config_path()).unwrap_or_else(|e| {
