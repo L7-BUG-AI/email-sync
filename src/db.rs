@@ -27,6 +27,8 @@ pub struct MailRecord<'a> {
     pub body_html: Option<&'a str>,
     pub zip_name: Option<&'a str>,
     pub zip_data: Option<&'a [u8]>,
+    /// false = 仅元数据（ENVELOPE），true = 含正文/附件全文
+    pub full_body: bool,
 }
 
 pub struct Db {
@@ -64,11 +66,23 @@ impl Db {
                 body_html   TEXT,
                 zip_name    TEXT,
                 zip_data    BLOB,
+                full_body   INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(folder_id, uid)
             );
             CREATE INDEX IF NOT EXISTS idx_messages_folder_uid ON messages(folder_id, uid);
             CREATE INDEX IF NOT EXISTS idx_messages_subject ON messages(subject);",
         )?;
+        // 旧库迁移：补 full_body 列（已有数据视为完整）
+        let mut has_col = self.conn.prepare(
+            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='full_body'",
+        )?;
+        let n: i64 = has_col.query_row([], |r| r.get(0))?;
+        if n == 0 {
+            self.conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN full_body INTEGER NOT NULL DEFAULT 0;
+                 UPDATE messages SET full_body = 1;",
+            )?;
+        }
         Ok(())
     }
 
@@ -128,8 +142,8 @@ impl Db {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages
                 (folder_id, uid, message_id, subject, from_addr, to_addr, date,
-                 received_at, body_text, body_html, zip_name, zip_data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8, ?9, ?10, ?11)",
+                 received_at, body_text, body_html, zip_name, zip_data, full_body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 m.folder_id,
                 m.uid,
@@ -142,9 +156,73 @@ impl Db {
                 m.body_html,
                 m.zip_name,
                 m.zip_data,
+                m.full_body,
             ],
         )?;
         Ok(())
+    }
+
+    /// 开始事务（批量插入提速）
+    pub fn begin(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN")?;
+        Ok(())
+    }
+
+    /// 提交事务
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    /// 元数据已存在则跳过；不存在则插入（同步用，幂等）
+    pub fn insert_meta_if_absent(&self, m: &MailRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO messages
+                (folder_id, uid, message_id, subject, from_addr, to_addr, date,
+                 received_at, full_body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), 0)",
+            rusqlite::params![
+                m.folder_id,
+                m.uid,
+                m.message_id,
+                m.subject,
+                m.from_addr,
+                m.to_addr,
+                m.date,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 补拉全文后更新：正文/附件/full_body=1（按 folder_id+uid）
+    pub fn update_full_body(
+        &self,
+        folder_id: i64,
+        uid: u32,
+        body_text: Option<&str>,
+        body_html: Option<&str>,
+        zip_name: Option<&str>,
+        zip_data: Option<&[u8]>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET body_text=?1, body_html=?2, zip_name=?3, zip_data=?4, full_body=1
+             WHERE folder_id=?5 AND uid=?6",
+            rusqlite::params![body_text, body_html, zip_name, zip_data, folder_id, uid],
+        )?;
+        Ok(())
+    }
+
+    /// 按 folder+uid 找本地消息 id（补拉用）
+    pub fn find_message(&self, folder_id: i64, uid: u32) -> Result<Option<i64>> {
+        let mut stmt =
+            self.conn
+                .prepare("SELECT id FROM messages WHERE folder_id=?1 AND uid=?2")?;
+        let mut rows = stmt.query_map([folder_id, uid as i64], |r| r.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(Ok(id)) => Ok(Some(id)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
     }
 
     /// 统计：文件夹数与邮件总数
@@ -212,7 +290,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, f.name, m.uid, m.message_id, m.subject, m.from_addr, m.to_addr,
                     m.date, m.received_at, m.body_text, m.body_html, m.zip_name,
-                    (m.zip_data IS NOT NULL) AS has_att
+                    (m.zip_data IS NOT NULL) AS has_att, m.full_body
              FROM messages m JOIN folders f ON m.folder_id = f.id
              WHERE m.id = ?1",
         )?;
@@ -272,6 +350,8 @@ pub struct MessageRow {
     pub body_html: Option<String>,
     pub zip_name: Option<String>,
     pub has_attachment: bool,
+    /// 是否已含正文/附件（false = 仅元数据，点开时按需补拉）
+    pub full_body: bool,
 }
 
 /// 构造查询 SQL + 参数（is_list: true 查行，false 查 COUNT）
@@ -279,7 +359,7 @@ fn build_query(folder: Option<&str>, search: Option<&str>, is_list: bool) -> (St
     let mut sql = if is_list {
         "SELECT m.id, f.name, m.uid, m.message_id, m.subject, m.from_addr, m.to_addr,
                 m.date, m.received_at, m.body_text, m.body_html, m.zip_name,
-                (m.zip_data IS NOT NULL) AS has_att
+                (m.zip_data IS NOT NULL) AS has_att, m.full_body
          FROM messages m JOIN folders f ON m.folder_id = f.id".to_string()
     } else {
         "SELECT COUNT(*) FROM messages m JOIN folders f ON m.folder_id = f.id".to_string()
@@ -327,6 +407,7 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         body_html: r.get(10)?,
         zip_name: r.get(11)?,
         has_attachment: r.get::<_, i64>(12)? != 0,
+        full_body: r.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -395,6 +476,7 @@ mod tests {
             body_html: None,
             zip_name: Some("att.zip"),
             zip_data: Some(&[1, 2, 3]),
+            full_body: true,
         };
         db.insert_message(&rec).unwrap();
         db.insert_message(&rec).unwrap(); // 重复插入被忽略
@@ -445,6 +527,7 @@ mod query_tests {
             body_html: None,
             zip_name: None,
             zip_data: None,
+            full_body: true,
         }
     }
         db.insert_message(&rec(inbox, 1, "周报 8月", "a@x.com")).unwrap();
@@ -532,6 +615,7 @@ mod query_tests {
             body_html: None,
             zip_name: Some("a.zip"),
             zip_data: Some(&[1, 2, 3]),
+            full_body: true,
         })
         .unwrap();
         let att = db.get_attachment(1).unwrap().unwrap();
@@ -550,6 +634,7 @@ mod query_tests {
             body_html: None,
             zip_name: None,
             zip_data: None,
+            full_body: true,
         })
         .unwrap();
         assert!(db.get_attachment(2).unwrap().is_none());

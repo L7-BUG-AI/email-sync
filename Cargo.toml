@@ -6,6 +6,7 @@ description = "把 IMAP 邮箱所有文件夹的邮件增量同步到本地 SQLi
 
 [dependencies]
 imap = "2"
+imap-proto = "0.10"
 native-tls = "0.2"
 mailparse = "0.16"
 rusqlite = { version = "0.32", features = ["bundled"] }

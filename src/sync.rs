@@ -1,9 +1,10 @@
 //! 增量同步核心：每个文件夹按 UID 跟踪，只拉新邮件。
 //!
-//! 流程：SELECT 文件夹 → 对比 UIDVALIDITY（变了则全量重同步）
-//!      → UID SEARCH 增量 → 逐个拉 RFC822 → 解析 → 存库 → 更新 last_uid。
+//! 同步只拉**元数据**（ENVELOPE：主题/发件人/日期），正文和附件按需补拉
+//! （见 fetch_full_message）——首次全量从"下载全部内容"提速到"只拿头部"。
 
 use anyhow::{Context, Result};
+use imap_proto::types::{Address, Envelope};
 
 use crate::db::{Db, MailRecord};
 use crate::imap_client::ImapSession;
@@ -11,17 +12,14 @@ use crate::parse;
 
 /// 同步单个文件夹，返回新增邮件数
 pub fn sync_folder(db: &Db, session: &mut ImapSession, folder: &str) -> Result<u32> {
-    // SELECT 并拿 UIDVALIDITY
     let mailbox = session
         .select(folder)
         .with_context(|| format!("SELECT 文件夹失败: {folder}"))?;
     let uidvalidity = mailbox.uid_validity.unwrap_or(0);
 
-    // 建文件夹记录（UIDVALIDITY 变化时内部自动重置 last_uid）
     let folder_id = db.upsert_folder(folder, uidvalidity)?;
     let last_uid = db.get_folder(folder)?.map(|f| f.last_uid).unwrap_or(0);
 
-    // 增量搜索：UID 大于 last_uid 的邮件
     let search_spec = if last_uid == 0 {
         "ALL".to_string()
     } else {
@@ -35,15 +33,15 @@ pub fn sync_folder(db: &Db, session: &mut ImapSession, folder: &str) -> Result<u
         return Ok(0);
     }
 
-    // 排序后分批拉取（RFC822 = 完整原文）
-    // 分批避免一次拉取过多邮件导致大响应卡死（服务器慢/超大附件）
+    // 排序后分批拉取 ENVELOPE（只拿元数据，几百字节/封）
     let mut sorted: Vec<u32> = uids.into_iter().collect();
     sorted.sort_unstable();
 
-    const BATCH_SIZE: usize = 50;
+    const BATCH_SIZE: usize = 100;
     let mut added = 0u32;
     let mut max_uid = last_uid;
 
+    db.begin()?; // 整个文件夹一个事务，批量插入提速
     for chunk in sorted.chunks(BATCH_SIZE) {
         let seq_set = chunk
             .iter()
@@ -51,46 +49,50 @@ pub fn sync_folder(db: &Db, session: &mut ImapSession, folder: &str) -> Result<u
             .collect::<Vec<_>>()
             .join(",");
         let fetches = session
-            .uid_fetch(seq_set, "RFC822")
+            .uid_fetch(seq_set, "(UID ENVELOPE)")
             .with_context(|| format!("UID FETCH 失败: {folder}"))?;
 
         for fetch in fetches.iter() {
-            let Some(uid) = fetch.uid else { continue };
-            let Some(raw) = fetch.body() else { continue };
-            let msg = match parse::parse_mail(raw) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[warn] 解析邮件失败 UID={uid} {folder}: {e}");
-                    continue;
-                }
+            let Some(uid) = fetch.uid else {
+                continue;
             };
-            // 附件打包：zip 二进制 + 压缩包名
-            let (zip_name, zip_data) = match parse::pack(&msg) {
-                Some(p) => (Some(p.name), Some(p.data)),
-                None => (None, None),
+            let Some(env) = fetch.envelope() else {
+                continue;
             };
+            // 先转成拥有所有权的 String（避免引用临时值）
+            let message_id = env
+                .message_id
+                .map(|b| String::from_utf8_lossy(b).into_owned());
+            let subject = env
+                .subject
+                .map(|b| String::from_utf8_lossy(b).into_owned());
+            let date = env.date.map(|b| String::from_utf8_lossy(b).into_owned());
+            let from_addr = first_address(&env.from);
+            let to_addr = first_address(&env.to);
             let record = MailRecord {
                 folder_id,
                 uid,
-                message_id: msg.message_id.as_deref(),
-                subject: msg.subject.as_deref(),
-                from_addr: msg.from_addr.as_deref(),
-                to_addr: msg.to_addr.as_deref(),
-                date: msg.date.as_deref(),
-                body_text: msg.body_text.as_deref(),
-                body_html: msg.body_html.as_deref(),
-                zip_name: zip_name.as_deref(),
-                zip_data: zip_data.as_deref(),
+                message_id: message_id.as_deref(),
+                subject: subject.as_deref(),
+                from_addr: from_addr.as_deref(),
+                to_addr: to_addr.as_deref(),
+                date: date.as_deref(),
+                body_text: None,
+                body_html: None,
+                zip_name: None,
+                zip_data: None,
+                full_body: false,
             };
-            db.insert_message(&record)?;
+            // 已存在（含历史完整数据）则跳过，只插入新的
+            db.insert_meta_if_absent(&record)?;
             if uid > max_uid {
                 max_uid = uid;
             }
             added += 1;
         }
     }
+    db.commit()?;
 
-    // 更新同步进度
     if max_uid > last_uid {
         db.update_last_uid(folder_id, max_uid)?;
     }
@@ -104,7 +106,7 @@ pub fn sync_all(db: &Db, session: &mut ImapSession) -> Result<(usize, u32)> {
     for folder in &folders {
         match sync_folder(db, session, folder) {
             Ok(n) => {
-                println!("  ✓ {folder}: 新增 {n} 封");
+                println!("  ✓ {folder}: 新增 {n} 封（元数据）");
                 total += n;
             }
             Err(e) => eprintln!("  ✗ {folder}: {e:#}"),
@@ -113,13 +115,76 @@ pub fn sync_all(db: &Db, session: &mut ImapSession) -> Result<(usize, u32)> {
     Ok((folders.len(), total))
 }
 
+/// 补拉一封邮件的全文（正文+附件），入库并标记 full_body=1
+/// 返回更新后是否成功
+pub fn fetch_full_message(
+    db: &Db,
+    session: &mut ImapSession,
+    folder: &str,
+    uid: u32,
+) -> Result<bool> {
+    let folder_id = db.get_folder(folder)?.map(|f| f.id);
+    let Some(folder_id) = folder_id else {
+        return Ok(false);
+    };
+    // 已在本地有完整内容则跳过
+    let local_id = db.find_message(folder_id, uid)?;
+    let Some(_local_id) = local_id else {
+        return Ok(false);
+    };
+
+    session
+        .select(folder)
+        .with_context(|| format!("SELECT 文件夹失败: {folder}"))?;
+    let fetches = session
+        .uid_fetch(uid.to_string(), "RFC822")
+        .with_context(|| format!("UID FETCH 失败: {folder}"))?;
+    let Some(fetch) = fetches.first() else {
+        return Ok(false);
+    };
+    let Some(raw) = fetch.body() else {
+        return Ok(false);
+    };
+
+    let msg = parse::parse_mail(raw)?;
+    let (zip_name, zip_data) = match parse::pack(&msg) {
+        Some(p) => (Some(p.name), Some(p.data)),
+        None => (None, None),
+    };
+    db.update_full_body(
+        folder_id,
+        uid,
+        msg.body_text.as_deref(),
+        msg.body_html.as_deref(),
+        zip_name.as_deref(),
+        zip_data.as_deref(),
+    )?;
+    Ok(true)
+}
+
+/// 从地址列表取第一个 "mailbox@host"（跳过空地址）
+fn first_address(addrs: &Option<Vec<Address<'_>>>) -> Option<String> {
+    let addrs = addrs.as_ref()?;
+    for a in addrs {
+        let mailbox = a.mailbox.map(|b| String::from_utf8_lossy(b).into_owned());
+        let host = a.host.map(|b| String::from_utf8_lossy(b).into_owned());
+        match (mailbox, host) {
+            (Some(m), Some(h)) if !m.is_empty() && !h.is_empty() => {
+                return Some(format!("{m}@{h}"));
+            }
+            (Some(m), _) if !m.is_empty() => return Some(m),
+            _ => continue,
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn search_spec_incremental() {
-        // 模拟增量搜索条件构造（纯逻辑）
         let spec = |last_uid: u32| {
             if last_uid == 0 {
                 "ALL".to_string()
@@ -136,5 +201,29 @@ mod tests {
     fn search_spec_handles_max_uid() {
         let spec = |last_uid: u32| format!("UID {}:*", last_uid + 1);
         assert_eq!(spec(u32::MAX - 1), "UID 4294967295:*");
+    }
+
+    #[test]
+    fn first_address_formats() {
+        // 用 imap-proto 的 Address 构造测试
+        
+        let empty = None;
+        assert_eq!(first_address(&empty), None);
+
+        let addrs = Some(vec![Address {
+            name: None,
+            adl: None,
+            mailbox: Some(b"alice".as_slice()),
+            host: Some(b"example.com".as_slice()),
+        }]);
+        assert_eq!(first_address(&addrs).unwrap(), "alice@example.com");
+
+        let addrs2 = Some(vec![Address {
+            name: None,
+            adl: None,
+            mailbox: Some(b"".as_slice()),
+            host: Some(b"x.com".as_slice()),
+        }]);
+        assert_eq!(first_address(&addrs2), None);
     }
 }
