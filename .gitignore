@@ -1,1 +1,4 @@
 /target
+src/assets/web/
+web/node_modules/
+web/dist/
