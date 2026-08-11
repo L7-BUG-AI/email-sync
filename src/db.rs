@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
+use serde::Serialize;
 
 /// 文件夹同步进度
 #[allow(dead_code)] // id/uidvalidity 供后续功能（状态展示/重置检测）使用
@@ -157,6 +158,87 @@ impl Db {
         Ok((folders, messages))
     }
 
+    /// 每个文件夹的邮件数（Web UI 侧栏）
+    pub fn list_folder_counts(&self) -> Result<Vec<FolderCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.name, COUNT(m.id) AS n
+             FROM folders f LEFT JOIN messages m ON m.folder_id = f.id
+             GROUP BY f.id ORDER BY n DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FolderCount {
+                name: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// 分页查询邮件（可选文件夹过滤 + 主题/发件人搜索）
+    pub fn query_messages(
+        &self,
+        folder: Option<&str>,
+        search: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<MessageRow>> {
+        let (sql, params) = build_query(folder, search, true);
+        // ?N 是 SQLite 编号参数，LIMIT/OFFSET 必须用不同编号
+        let n = params.len() + 1;
+        let sql = format!("{sql} LIMIT ?{n} OFFSET ?{n2}", n = n, n2 = n + 1);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(
+            params
+                .into_iter()
+                .chain([rusqlite::types::Value::from(limit), rusqlite::types::Value::from(offset)]),
+        ))?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(row_from(r)?);
+        }
+        Ok(out)
+    }
+
+    /// 符合过滤条件的邮件总数（分页用）
+    pub fn count_messages(&self, folder: Option<&str>, search: Option<&str>) -> Result<i64> {
+        let (sql, params) = build_query(folder, search, false);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let n = stmt.query_row(rusqlite::params_from_iter(params), |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// 单封邮件详情
+    pub fn get_message(&self, id: i64) -> Result<Option<MessageRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, f.name, m.uid, m.message_id, m.subject, m.from_addr, m.to_addr,
+                    m.date, m.received_at, m.body_text, m.body_html, m.zip_name,
+                    (m.zip_data IS NOT NULL) AS has_att
+             FROM messages m JOIN folders f ON m.folder_id = f.id
+             WHERE m.id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], row_from)?;
+        match rows.next() {
+            Some(Ok(r)) => Ok(Some(r)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
+    /// 附件 zip（zip_name + zip_data），无附件返回 None
+    pub fn get_attachment(&self, id: i64) -> Result<Option<(String, Vec<u8>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT zip_name, zip_data FROM messages WHERE id = ?1 AND zip_data IS NOT NULL",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        match rows.next() {
+            Some(Ok(v)) => Ok(Some(v)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     /// 测试用：内存数据库
     #[cfg(test)]
     fn in_memory() -> Result<Db> {
@@ -165,6 +247,87 @@ impl Db {
         db.init()?;
         Ok(db)
     }
+}
+
+/// 文件夹邮件数（Web UI 侧栏）
+#[derive(Debug, Serialize)]
+pub struct FolderCount {
+    pub name: String,
+    pub count: i64,
+}
+
+/// 邮件行（Web UI 列表/详情）
+#[derive(Debug, Serialize)]
+pub struct MessageRow {
+    pub id: i64,
+    pub folder: String,
+    pub uid: u32,
+    pub message_id: Option<String>,
+    pub subject: Option<String>,
+    pub from_addr: Option<String>,
+    pub to_addr: Option<String>,
+    pub date: Option<String>,
+    pub received_at: Option<String>,
+    pub body_text: Option<String>,
+    pub body_html: Option<String>,
+    pub zip_name: Option<String>,
+    pub has_attachment: bool,
+}
+
+/// 构造查询 SQL + 参数（is_list: true 查行，false 查 COUNT）
+fn build_query(folder: Option<&str>, search: Option<&str>, is_list: bool) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = if is_list {
+        "SELECT m.id, f.name, m.uid, m.message_id, m.subject, m.from_addr, m.to_addr,
+                m.date, m.received_at, m.body_text, m.body_html, m.zip_name,
+                (m.zip_data IS NOT NULL) AS has_att
+         FROM messages m JOIN folders f ON m.folder_id = f.id".to_string()
+    } else {
+        "SELECT COUNT(*) FROM messages m JOIN folders f ON m.folder_id = f.id".to_string()
+    };
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    let mut wheres: Vec<String> = Vec::new();
+    if let Some(f) = folder {
+        if f != "全部" {
+            wheres.push("f.name = ?".to_string());
+            params.push(f.to_string().into());
+        }
+    }
+    if let Some(s) = search {
+        let s = s.trim();
+        if !s.is_empty() {
+            wheres.push("(m.subject LIKE ? OR m.from_addr LIKE ? OR m.to_addr LIKE ?)".to_string());
+            let like = format!("%{s}%");
+            params.push(like.clone().into());
+            params.push(like.clone().into());
+            params.push(like.into());
+        }
+    }
+    if !wheres.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&wheres.join(" AND "));
+    }
+    if is_list {
+        sql.push_str(" ORDER BY COALESCE(m.date, m.received_at) DESC");
+    }
+    (sql, params)
+}
+
+fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+    Ok(MessageRow {
+        id: r.get(0)?,
+        folder: r.get(1)?,
+        uid: r.get::<_, i64>(2)? as u32,
+        message_id: r.get(3)?,
+        subject: r.get(4)?,
+        from_addr: r.get(5)?,
+        to_addr: r.get(6)?,
+        date: r.get(7)?,
+        received_at: r.get(8)?,
+        body_text: r.get(9)?,
+        body_html: r.get(10)?,
+        zip_name: r.get(11)?,
+        has_attachment: r.get::<_, i64>(12)? != 0,
+    })
 }
 
 #[cfg(test)]
@@ -259,5 +422,136 @@ mod tests {
         db.upsert_folder("INBOX", 1).unwrap();
         db.upsert_folder("Sent", 1).unwrap();
         assert_eq!(db.stats().unwrap(), (2, 0));
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    fn seed(db: &Db) -> (i64, i64) {
+        let inbox = db.upsert_folder("INBOX", 1).unwrap();
+        let sent = db.upsert_folder("Sent", 1).unwrap();
+    fn rec<'a>(folder_id: i64, uid: u32, subject: &'a str, from: &'a str) -> MailRecord<'a> {
+        MailRecord {
+            folder_id,
+            uid,
+            message_id: Some("m"),
+            subject: Some(subject),
+            from_addr: Some(from),
+            to_addr: None,
+            date: Some("2026-08-10"),
+            body_text: Some("body"),
+            body_html: None,
+            zip_name: None,
+            zip_data: None,
+        }
+    }
+        db.insert_message(&rec(inbox, 1, "周报 8月", "a@x.com")).unwrap();
+        db.insert_message(&rec(inbox, 2, "会议纪要", "b@x.com")).unwrap();
+        db.insert_message(&rec(sent, 1, "回复：周报", "me@x.com")).unwrap();
+        (inbox, sent)
+    }
+
+    #[test]
+    fn folder_counts() {
+        let db = Db::in_memory().unwrap();
+        seed(&db);
+        let counts = db.list_folder_counts().unwrap();
+        let map: std::collections::HashMap<_, _> =
+            counts.into_iter().map(|c| (c.name, c.count)).collect();
+        assert_eq!(map.get("INBOX"), Some(&2));
+        assert_eq!(map.get("Sent"), Some(&1));
+    }
+
+    #[test]
+    fn query_all_paginated() {
+        let db = Db::in_memory().unwrap();
+        seed(&db);
+        let all = db.query_messages(None, None, 10, 0).unwrap();
+        assert_eq!(all.len(), 3);
+        // date 相同，排序不稳定，只验证集合
+        let subs: Vec<&str> = all.iter().map(|m| m.subject.as_deref().unwrap()).collect();
+        assert!(subs.contains(&"周报 8月"));
+        assert!(subs.contains(&"会议纪要"));
+        let page = db.query_messages(None, None, 2, 0).unwrap();
+        assert_eq!(page.len(), 2);
+        let page2 = db.query_messages(None, None, 2, 2).unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(db.count_messages(None, None).unwrap(), 3);
+    }
+
+    #[test]
+    fn query_by_folder() {
+        let db = Db::in_memory().unwrap();
+        seed(&db);
+        let inbox = db.query_messages(Some("INBOX"), None, 10, 0).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert!(inbox.iter().all(|m| m.folder == "INBOX"));
+        let sent = db.query_messages(Some("Sent"), None, 10, 0).unwrap();
+        assert_eq!(sent.len(), 1);
+        // "全部"不过滤
+        assert_eq!(db.query_messages(Some("全部"), None, 10, 0).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn query_by_search() {
+        let db = Db::in_memory().unwrap();
+        seed(&db);
+        let r = db.query_messages(None, Some("周报"), 10, 0).unwrap();
+        assert_eq!(r.len(), 2);
+        let r2 = db.query_messages(None, Some("x.com"), 10, 0).unwrap();
+        assert_eq!(r2.len(), 3); // a@x.com, b@x.com, me@x.com
+        assert_eq!(db.count_messages(None, Some("周报")).unwrap(), 2);
+    }
+
+    #[test]
+    fn get_message_detail() {
+        let db = Db::in_memory().unwrap();
+        seed(&db);
+        let m = db.get_message(1).unwrap().unwrap();
+        assert_eq!(m.folder, "INBOX");
+        assert!(!m.has_attachment);
+        assert_eq!(m.body_text.as_deref(), Some("body"));
+        assert!(db.get_message(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_attachment_only_when_present() {
+        let db = Db::in_memory().unwrap();
+        let fid = db.upsert_folder("INBOX", 1).unwrap();
+        db.insert_message(&MailRecord {
+            folder_id: fid,
+            uid: 1,
+            message_id: None,
+            subject: Some("带附件"),
+            from_addr: None,
+            to_addr: None,
+            date: None,
+            body_text: None,
+            body_html: None,
+            zip_name: Some("a.zip"),
+            zip_data: Some(&[1, 2, 3]),
+        })
+        .unwrap();
+        let att = db.get_attachment(1).unwrap().unwrap();
+        assert_eq!(att.0, "a.zip");
+        assert_eq!(att.1, vec![1, 2, 3]);
+        // 无附件邮件
+        db.insert_message(&MailRecord {
+            folder_id: fid,
+            uid: 2,
+            message_id: None,
+            subject: Some("无附件"),
+            from_addr: None,
+            to_addr: None,
+            date: None,
+            body_text: None,
+            body_html: None,
+            zip_name: None,
+            zip_data: None,
+        })
+        .unwrap();
+        assert!(db.get_attachment(2).unwrap().is_none());
     }
 }
