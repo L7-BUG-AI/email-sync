@@ -2,16 +2,43 @@
 
 把 IMAP 邮箱**所有文件夹**的邮件**增量同步**到本地 SQLite，附件自动打包成 zip 存二进制字段。
 
-用数据库连接工具（DBeaver / Navicat / sqlite3 CLI）直接查库即可，无 GUI。
+提供两种使用方式：
+- **Web UI**：浏览器查看邮件、搜索、下载附件、一键同步（推荐）
+- **DB 直查**：用数据库连接工具（DBeaver / Navicat / sqlite3 CLI）直接查库
 
 ## 用法
 
 ```bash
+email-sync serve                 # 启动 Web UI（默认 http://localhost:8080）
+EMAIL_SYNC_PORT=9000 email-sync serve   # 自定义端口
+
 email-sync sync                 # 同步所有文件夹（默认命令）
 email-sync sync --folder INBOX  # 只同步指定文件夹
 email-sync status               # 查看数据库统计
 email-sync --config <path>      # 指定配置文件
 ```
+
+## Web UI
+
+启动 `email-sync serve` 后，浏览器打开 `http://localhost:8080`：
+
+- 📁 左侧文件夹列表（全部/Junk/INBOX/Sent/Drafts，带邮件数）
+- 📋 中间邮件列表（分页 30 封/页，主题/发件人/日期，📎 附件标记）
+- 🔍 顶部搜索（按主题/发件人/收件人，实时过滤）
+- 📄 右侧详情面板（正文 + 附件下载链接）
+- 🔄 "立即同步"按钮（页面上直接触发增量同步）
+
+架构：Rust `axum` 内置 HTTP 服务 + 单 HTML 原生 JS（参考 motrix-next 的"Rust 后端 + Web 前端"思路，砍掉桌面打包层）。API：
+
+| 路由 | 说明 |
+|---|---|
+| `GET /` | 页面 |
+| `GET /api/folders` | 文件夹 + 邮件数 |
+| `GET /api/messages?folder=&search=&page=` | 邮件列表（分页）|
+| `GET /api/messages/:id` | 邮件详情 |
+| `GET /api/messages/:id/attachments` | 附件 zip 下载 |
+| `GET /api/status` | 数据库统计 |
+| `POST /api/sync` | 触发增量同步 |
 
 ## 配置文件
 
@@ -89,12 +116,13 @@ sqlite3 ~/.local/share/email-sync/email.db \
 - `mailparse` — RFC822 解析（主题/正文/附件）
 - `rusqlite` (bundled) — SQLite 存储
 - `zip` — 附件打包（deflate）
+- `axum` + `tokio` — Web UI 服务
 
 ## 构建
 
 ```bash
-cargo build --release   # 产物 target/release/email-sync（约 1.9MB）
-cargo test              # 26 个单元测试
+cargo build --release   # 产物 target/release/email-sync（约 2.3MB）
+cargo test              # 32 个单元测试
 ```
 
 ## 说明
