@@ -38,9 +38,11 @@
 
         <div class="body">
           <pre v-if="message.body_text" class="text-body">{{ message.body_text }}</pre>
-          <div v-else-if="message.body_html" class="html-hint">
-            （HTML 邮件，附件可直接下载）
-          </div>
+          <div
+            v-else-if="message.body_html"
+            class="html-body"
+            v-html="sanitizedHtml"
+          ></div>
           <div v-else class="html-hint">（无正文）</div>
         </div>
       </template>
@@ -65,6 +67,21 @@ const visibleModel = computed({
   set: (v) => {
     if (!v) emit('close')
   },
+})
+
+// HTML 正文安全化：移除 script/iframe/object 等可执行标签，保留排版
+const sanitizedHtml = computed(() => {
+  const html = props.message?.body_html || ''
+  if (!html) return ''
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<object[\s\S]*?<\/object>/gi, '')
+    .replace(/<embed[\s\S]*?>/gi, '')
+    .replace(/on\w+="[^"]*"/gi, '')
+    .replace(/on\w+='[^']*'/gi, '')
+    .replace(/on\w+=\s*\w+/gi, '')
+    .replace(/javascript:/gi, '')
 })
 </script>
 
@@ -96,6 +113,14 @@ const visibleModel = computed({
   font-family: inherit;
   font-size: 14px;
   line-height: 1.7;
+}
+.html-body {
+  font-size: 14px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+.html-body :deep(img) {
+  max-width: 100%;
 }
 .html-hint {
   color: var(--el-text-color-secondary);

@@ -17,7 +17,7 @@
     <el-container class="body">
       <el-aside width="220px" class="aside">
         <FolderNav
-          :folders="folders"
+          :folders="state.folders"
           :current="state.curFolder"
           @select="onSelectFolder"
         />

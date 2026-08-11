@@ -7,7 +7,7 @@
     <el-menu-item index="全部">
       <el-icon><Folder /></el-icon>
       <span>全部</span>
-      <el-badge :value="totalCount" class="badge" />
+      <el-badge :value="totalCount" :max="99999" class="badge" />
     </el-menu-item>
     <el-menu-item
       v-for="f in folders"
@@ -16,7 +16,7 @@
     >
       <el-icon><FolderOpened /></el-icon>
       <span>{{ f.name }}</span>
-      <el-badge :value="f.count" class="badge" />
+      <el-badge :value="f.count" :max="99999" class="badge" />
     </el-menu-item>
   </el-menu>
 </template>
