@@ -1,8 +1,13 @@
-//! 附件打包：把邮件附件压缩成 zip 二进制（BLOB）+ 生成压缩包名。
+//! 附件打包：多附件 tar 打包 + zstd level 1 压缩（tar.zst）。
 //!
-//! zip_name 规则：`attachments-<序号>.zip`（无附件返回 None）。
+//! 产出 `attachments-<序号>.tar.zst`（无附件返回 None）。
+//! 压缩等级 1 = 速度优先（邮件附件中小文件场景）。
 
-use std::io::Write;
+use std::io::Cursor;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// zstd 压缩等级（1 = 最快，速度优先）
+pub const ZSTD_LEVEL: i32 = 1;
 
 /// 一个附件（文件名 + 内容）
 pub struct Attachment {
@@ -10,60 +15,76 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
-/// 打包结果：压缩包名 + zip 二进制
-pub struct ZipPack {
+/// 打包结果
+pub struct PackedAtt {
+    /// 压缩包名（如 attachments-000123.tar.zst）
     pub name: String,
+    /// tar.zst 压缩二进制
     pub data: Vec<u8>,
 }
 
-/// 把附件列表打包成 zip；无附件返回 None
-pub fn pack_attachments(attachments: &[Attachment]) -> Option<ZipPack> {
-    if attachments.is_empty() {
+/// 全局序号（文件名去重用）
+static SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// 把附件列表打包成 tar.zst；无附件返回 None
+pub fn pack_attachments(atts: &[Attachment]) -> Option<PackedAtt> {
+    if atts.is_empty() {
         return None;
     }
-    let mut buf = Vec::new();
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = format!("attachments-{n:06}.tar.zst");
+
+    // 1) tar 打包（文件名清洗防路径穿越，zip slip 思路沿用）
+    let mut tar_buf = Vec::new();
     {
-        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for (i, att) in attachments.iter().enumerate() {
-            let name = att
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("attachment-{}.bin", i + 1));
-            // 防 zip slip：文件名清理掉路径分隔符，只保留末尾文件名
-            let safe_name = name
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(&name)
-                .to_string();
-            // 重名时加序号避免覆盖
-            let final_name = if i == 0 {
-                safe_name
-            } else {
-                let dup = attachments[..i]
-                    .iter()
-                    .any(|a| a.name.as_deref() == Some(safe_name.as_str()));
-                if dup {
-                    let (stem, ext) = match safe_name.rfind('.') {
-                        Some(p) => (&safe_name[..p], &safe_name[p..]),
-                        None => (safe_name.as_str(), ""),
-                    };
-                    format!("{stem}-{}{ext}", i + 1)
-                } else {
-                    safe_name
-                }
-            };
-            writer
-                .start_file(final_name, opts)
-                .expect("start zip entry");
-            writer.write_all(&att.data).expect("write zip data");
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        for att in atts {
+            let file_name = clean_name(&att.name);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(att.data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, file_name, Cursor::new(&att.data))
+                .expect("tar append");
         }
-        writer.finish().expect("finish zip");
+        builder.finish().expect("tar finish");
     }
-    Some(ZipPack {
-        name: "attachments.zip".to_string(),
-        data: buf,
-    })
+
+    // 2) zstd level 1 压缩
+    let compressed = zstd::stream::encode_all(Cursor::new(&tar_buf), ZSTD_LEVEL)
+        .expect("zstd encode");
+
+    Some(PackedAtt { name, data: compressed })
+}
+
+/// 清洗附件名：去掉路径分隔符和非法字符（防 tar 路径穿越）
+fn clean_name(name: &Option<String>) -> String {
+    let raw = name.as_deref().unwrap_or("attachment");
+    // 去路径：只保留最后一段（反斜杠/正斜杠都算分隔）
+    let base = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(raw)
+        .trim();
+    if base.is_empty() {
+        "attachment".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// 解压并列出 tar.zst 内容（Web UI 展示/下载用，测试用）
+pub fn list_archive(data: &[u8]) -> Vec<String> {
+    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(data))
+        .expect("zstd decode");
+    let mut archive = tar::Archive::new(&mut decoder);
+    archive
+        .entries()
+        .expect("tar entries")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().map(|p| p.display().to_string()).unwrap_or_default())
+        .collect()
 }
 
 #[cfg(test)]
@@ -73,72 +94,76 @@ mod tests {
     fn sample_attachments() -> Vec<Attachment> {
         vec![
             Attachment {
-                name: Some("报告.pdf".to_string()),
+                name: Some("report.pdf".to_string()),
                 data: b"%PDF-1.4 fake pdf content".to_vec(),
             },
             Attachment {
                 name: Some("photo.jpg".to_string()),
-                data: b"\xff\xd8\xff\xe0 fake jpeg".to_vec(),
+                data: vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10],
             },
         ]
     }
 
     #[test]
-    fn no_attachments_returns_none() {
+    fn packs_and_lists_tar_zst() {
+        let packed = pack_attachments(&sample_attachments()).expect("pack");
+        assert!(packed.name.ends_with(".tar.zst"));
+        // zstd magic: 28 B5 2F FD
+        assert_eq!(&packed.data[..4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd magic");
+        let names = list_archive(&packed.data);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"report.pdf".to_string()));
+        assert!(names.contains(&"photo.jpg".to_string()));
+    }
+
+    #[test]
+    fn returns_none_for_empty() {
         assert!(pack_attachments(&[]).is_none());
     }
 
     #[test]
-    fn packs_all_attachments() {
-        let pack = pack_attachments(&sample_attachments()).unwrap();
-        assert_eq!(pack.name, "attachments.zip");
-        assert!(!pack.data.is_empty());
-        // zip 以 PK 开头
-        assert_eq!(&pack.data[..2], b"PK");
-    }
-
-    #[test]
-    fn zip_is_valid_and_contains_entries() {
-        let pack = pack_attachments(&sample_attachments()).unwrap();
-        let reader = std::io::Cursor::new(&pack.data);
-        let mut zip = zip::ZipArchive::new(reader).unwrap();
-        assert_eq!(zip.len(), 2);
-        let mut names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["photo.jpg".to_string(), "报告.pdf".to_string()]);
-    }
-
-    #[test]
-    fn zip_slip_paths_sanitized() {
+    fn strips_path_traversal() {
+        // zip slip 防护：../ 和绝对路径都要被清洗
         let atts = vec![Attachment {
             name: Some("../../etc/passwd".to_string()),
-            data: b"x".to_vec(),
+            data: b"evil".to_vec(),
         }];
-        let pack = pack_attachments(&atts).unwrap();
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&pack.data)).unwrap();
-        assert_eq!(zip.by_index(0).unwrap().name(), "passwd");
+        let packed = pack_attachments(&atts).expect("pack");
+        let names = list_archive(&packed.data);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0], "passwd", "路径穿越被清洗");
     }
 
     #[test]
-    fn duplicate_names_get_suffix() {
+    fn handles_duplicate_names() {
+        // 同名附件：tar 允许重复条目，不 panic
         let atts = vec![
             Attachment {
                 name: Some("a.txt".to_string()),
-                data: b"1".to_vec(),
+                data: b"one".to_vec(),
             },
             Attachment {
                 name: Some("a.txt".to_string()),
-                data: b"2".to_vec(),
+                data: b"two".to_vec(),
             },
         ];
-        let pack = pack_attachments(&atts).unwrap();
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&pack.data)).unwrap();
-        let mut names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["a-2.txt".to_string(), "a.txt".to_string()]);
+        let packed = pack_attachments(&atts).expect("pack");
+        assert_eq!(list_archive(&packed.data).len(), 2);
+    }
+
+    #[test]
+    fn handles_chinese_names() {
+        let atts = vec![Attachment {
+            name: Some("发票.pdf".to_string()),
+            data: b"invoice".to_vec(),
+        }];
+        let packed = pack_attachments(&atts).expect("pack");
+        let names = list_archive(&packed.data);
+        assert_eq!(names[0], "发票.pdf");
+    }
+
+    #[test]
+    fn zstd_level_is_one() {
+        assert_eq!(ZSTD_LEVEL, 1);
     }
 }

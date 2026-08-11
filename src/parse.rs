@@ -5,7 +5,7 @@
 use anyhow::Result;
 use mailparse::DispositionType;
 
-use crate::attach::{pack_attachments, Attachment, ZipPack};
+use crate::attach::{pack_attachments, Attachment, PackedAtt};
 
 /// 解析结果（对应 messages 表字段 + 附件）
 #[allow(dead_code)]
@@ -48,8 +48,8 @@ pub fn parse_mail(raw: &[u8]) -> Result<ParsedMessage> {
     Ok(out)
 }
 
-/// 把解析结果打包成附件 zip（无附件返回 None）
-pub fn pack(mail: &ParsedMessage) -> Option<ZipPack> {
+/// 把解析结果打包成附件 tar.zst（无附件返回 None）
+pub fn pack(mail: &ParsedMessage) -> Option<PackedAtt> {
     pack_attachments(&mail.attachments)
 }
 
@@ -195,12 +195,12 @@ mod tests {
     }
 
     #[test]
-    fn pack_attachments_to_zip() {
+    fn pack_attachments_to_tar_zst() {
         let m = parse_mail(&sample_mail()).unwrap();
         let pack = pack(&m).unwrap();
-        assert_eq!(pack.name, "attachments.zip");
-        assert_eq!(&pack.data[..2], b"PK");
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&pack.data)).unwrap();
-        assert_eq!(zip.len(), 2);
+        assert!(pack.name.ends_with(".tar.zst"));
+        assert_eq!(&pack.data[..4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd magic");
+        let names = crate::attach::list_archive(&pack.data);
+        assert_eq!(names.len(), 2);
     }
 }

@@ -2,7 +2,7 @@
 name = "email-sync"
 version = "0.1.0"
 edition = "2021"
-description = "把 IMAP 邮箱所有文件夹的邮件增量同步到本地 SQLite，附件打包 zip 存二进制字段"
+description = "把 IMAP 邮箱所有文件夹的邮件增量同步到本地 SQLite，附件 tar.zst + 正文 zstd 压缩存储"
 
 [dependencies]
 imap = "2"
@@ -10,10 +10,11 @@ imap-proto = "0.10"
 native-tls = "0.2"
 mailparse = "0.16"
 rusqlite = { version = "0.32", features = ["bundled"] }
+zstd = "0.13"
+tar = "0.4"
 include_dir = "0.7"
 base64 = "0.22"
 encoding_rs = "0.8"
-zip = { version = "2", default-features = false, features = ["deflate"] }
 anyhow = "1"
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }

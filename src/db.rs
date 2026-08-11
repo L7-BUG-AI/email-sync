@@ -24,10 +24,11 @@ pub struct MailRecord<'a> {
     pub from_addr: Option<&'a str>,
     pub to_addr: Option<&'a str>,
     pub date: Option<&'a str>,
-    pub body_text: Option<&'a str>,
-    pub body_html: Option<&'a str>,
-    pub zip_name: Option<&'a str>,
-    pub zip_data: Option<&'a [u8]>,
+    /// 正文（已 zstd 压缩字节）
+    pub body_text: Option<&'a [u8]>,
+    pub body_html: Option<&'a [u8]>,
+    pub att_name: Option<&'a str>,
+    pub att_data: Option<&'a [u8]>,
     /// false = 仅元数据（ENVELOPE），true = 含正文/附件全文
     pub full_body: bool,
 }
@@ -65,26 +66,38 @@ impl Db {
                 to_addr     TEXT,
                 date        TEXT,
                 received_at TEXT,
-                body_text   TEXT,
-                body_html   TEXT,
-                zip_name    TEXT,
-                zip_data    BLOB,
+                body_text   BLOB,
+                body_html   BLOB,
+                att_name    TEXT,
+                att_data    BLOB,
                 full_body   INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(folder_id, uid)
             );
             CREATE INDEX IF NOT EXISTS idx_messages_folder_uid ON messages(folder_id, uid);
             CREATE INDEX IF NOT EXISTS idx_messages_subject ON messages(subject);",
         )?;
-        // 旧库迁移：补 full_body 列（已有数据视为完整）
-        let mut has_col = self.conn.prepare(
-            "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='full_body'",
-        )?;
+        // 旧库迁移（幂等）：
+        // 1. full_body 列（旧库无此列）
+        let mut has_col = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='full_body'")?;
         let n: i64 = has_col.query_row([], |r| r.get(0))?;
         if n == 0 {
             self.conn.execute_batch(
                 "ALTER TABLE messages ADD COLUMN full_body INTEGER NOT NULL DEFAULT 0;
                  UPDATE messages SET full_body = 1;",
             )?;
+        }
+        // 2. zip_data → att_data、zip_name → att_name（zip 格式 → tar.zst 格式）
+        for (old, new) in [("zip_data", "att_data"), ("zip_name", "att_name")] {
+            let mut has = self
+                .conn
+                .prepare(&format!("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='{old}'"))?;
+            let cnt: i64 = has.query_row([], |r| r.get(0))?;
+            if cnt > 0 {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE messages RENAME COLUMN {old} TO {new};"))?;
+            }
         }
         Ok(())
     }
@@ -146,7 +159,7 @@ impl Db {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages
                 (folder_id, uid, message_id, subject, from_addr, to_addr, date,
-                 received_at, body_text, body_html, zip_name, zip_data, full_body)
+                 received_at, body_text, body_html, att_name, att_data, full_body)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 m.folder_id,
@@ -158,8 +171,8 @@ impl Db {
                 m.date,
                 m.body_text,
                 m.body_html,
-                m.zip_name,
-                m.zip_data,
+                m.att_name,
+                m.att_data,
                 m.full_body,
             ],
         )?;
@@ -203,15 +216,15 @@ impl Db {
         &self,
         folder_id: i64,
         uid: u32,
-        body_text: Option<&str>,
-        body_html: Option<&str>,
-        zip_name: Option<&str>,
-        zip_data: Option<&[u8]>,
+        body_text: Option<&[u8]>,
+        body_html: Option<&[u8]>,
+        att_name: Option<&str>,
+        att_data: Option<&[u8]>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE messages SET body_text=?1, body_html=?2, zip_name=?3, zip_data=?4, full_body=1
+            "UPDATE messages SET body_text=?1, body_html=?2, att_name=?3, att_data=?4, full_body=1
              WHERE folder_id=?5 AND uid=?6",
-            rusqlite::params![body_text, body_html, zip_name, zip_data, folder_id, uid],
+            rusqlite::params![body_text, body_html, att_name, att_data, folder_id, uid],
         )?;
         Ok(())
     }
@@ -293,8 +306,8 @@ impl Db {
     pub fn get_message(&self, id: i64) -> Result<Option<MessageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, f.name, m.uid, m.message_id, m.subject, m.from_addr, m.to_addr,
-                    m.date, m.received_at, m.body_text, m.body_html, m.zip_name,
-                    (m.zip_data IS NOT NULL) AS has_att, m.full_body
+                    m.date, m.received_at, m.body_text, m.body_html, m.att_name,
+                    (m.att_data IS NOT NULL) AS has_att, m.full_body
              FROM messages m JOIN folders f ON m.folder_id = f.id
              WHERE m.id = ?1",
         )?;
@@ -306,10 +319,10 @@ impl Db {
         }
     }
 
-    /// 附件 zip（zip_name + zip_data），无附件返回 None
+    /// 附件（att_name + att_data tar.zst），无附件返回 None
     pub fn get_attachment(&self, id: i64) -> Result<Option<(String, Vec<u8>)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT zip_name, zip_data FROM messages WHERE id = ?1 AND zip_data IS NOT NULL",
+            "SELECT att_name, att_data FROM messages WHERE id = ?1 AND att_data IS NOT NULL",
         )?;
         let mut rows = stmt.query_map([id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -352,7 +365,7 @@ pub struct MessageRow {
     pub received_at: Option<String>,
     pub body_text: Option<String>,
     pub body_html: Option<String>,
-    pub zip_name: Option<String>,
+    pub att_name: Option<String>,
     pub has_attachment: bool,
     /// 是否已含正文/附件（false = 仅元数据，点开时按需补拉）
     pub full_body: bool,
@@ -362,8 +375,8 @@ pub struct MessageRow {
 fn build_query(folder: Option<&str>, search: Option<&str>, is_list: bool) -> (String, Vec<rusqlite::types::Value>) {
     let mut sql = if is_list {
         "SELECT m.id, f.name, m.uid, m.message_id, m.subject, m.from_addr, m.to_addr,
-                m.date, m.received_at, m.body_text, m.body_html, m.zip_name,
-                (m.zip_data IS NOT NULL) AS has_att, m.full_body
+                m.date, m.received_at, m.body_text, m.body_html, m.att_name,
+                (m.att_data IS NOT NULL) AS has_att, m.full_body
          FROM messages m JOIN folders f ON m.folder_id = f.id".to_string()
     } else {
         "SELECT COUNT(*) FROM messages m JOIN folders f ON m.folder_id = f.id".to_string()
@@ -407,12 +420,25 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
         to_addr: r.get(6)?,
         date: r.get(7)?,
         received_at: r.get(8)?,
-        body_text: r.get(9)?,
-        body_html: r.get(10)?,
-        zip_name: r.get(11)?,
+        body_text: r.get::<_, Option<Vec<u8>>>(9)?.and_then(|b| decompress_text(&b).ok()),
+        body_html: r.get::<_, Option<Vec<u8>>>(10)?.and_then(|b| decompress_text(&b).ok()),
+        att_name: r.get(11)?,
         has_attachment: r.get::<_, i64>(12)? != 0,
         full_body: r.get::<_, i64>(13)? != 0,
     })
+}
+
+/// zstd 压缩正文（level 1，速度优先）
+pub fn compress_text(text: &str) -> Vec<u8> {
+    zstd::stream::encode_all(text.as_bytes(), crate::attach::ZSTD_LEVEL)
+        .expect("zstd compress body")
+}
+
+/// zstd 解压正文
+pub fn decompress_text(data: &[u8]) -> Result<String> {
+    let mut out = Vec::new();
+    zstd::stream::copy_decode(data, &mut out)?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
@@ -476,10 +502,10 @@ mod tests {
             from_addr: Some("a@b.com"),
             to_addr: None,
             date: None,
-            body_text: Some("body"),
+            body_text: Some(&compress_text("body")),
             body_html: None,
-            zip_name: Some("att.zip"),
-            zip_data: Some(&[1, 2, 3]),
+            att_name: Some("att.tar.zst"),
+            att_data: Some(&[1, 2, 3]),
             full_body: true,
         };
         db.insert_message(&rec).unwrap();
@@ -493,12 +519,12 @@ mod tests {
         let (name, data): (String, Vec<u8>) = db
             .conn
             .query_row(
-                "SELECT zip_name, zip_data FROM messages WHERE uid=42",
+                "SELECT att_name, att_data FROM messages WHERE uid=42",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(name, "att.zip");
+        assert_eq!(name, "att.tar.zst");
         assert_eq!(data, vec![1, 2, 3]);
     }
 
@@ -518,7 +544,23 @@ mod query_tests {
     fn seed(db: &Db) -> (i64, i64) {
         let inbox = db.upsert_folder("INBOX", 1).unwrap();
         let sent = db.upsert_folder("Sent", 1).unwrap();
-    fn rec<'a>(folder_id: i64, uid: u32, subject: &'a str, from: &'a str) -> MailRecord<'a> {
+        let body = compress_text("body");
+        db.insert_message(&rec(inbox, 1, "周报 8月", "a@x.com", Some(&body)))
+            .unwrap();
+        db.insert_message(&rec(inbox, 2, "会议纪要", "b@x.com", None))
+            .unwrap();
+        db.insert_message(&rec(sent, 1, "回复：周报", "me@x.com", None))
+            .unwrap();
+        (inbox, sent)
+    }
+
+    fn rec<'a>(
+        folder_id: i64,
+        uid: u32,
+        subject: &'a str,
+        from: &'a str,
+        body: Option<&'a [u8]>,
+    ) -> MailRecord<'a> {
         MailRecord {
             folder_id,
             uid,
@@ -527,17 +569,12 @@ mod query_tests {
             from_addr: Some(from),
             to_addr: None,
             date: Some("2026-08-10"),
-            body_text: Some("body"),
+            body_text: body,
             body_html: None,
-            zip_name: None,
-            zip_data: None,
+            att_name: None,
+            att_data: None,
             full_body: true,
         }
-    }
-        db.insert_message(&rec(inbox, 1, "周报 8月", "a@x.com")).unwrap();
-        db.insert_message(&rec(inbox, 2, "会议纪要", "b@x.com")).unwrap();
-        db.insert_message(&rec(sent, 1, "回复：周报", "me@x.com")).unwrap();
-        (inbox, sent)
     }
 
     #[test]
@@ -617,13 +654,13 @@ mod query_tests {
             date: None,
             body_text: None,
             body_html: None,
-            zip_name: Some("a.zip"),
-            zip_data: Some(&[1, 2, 3]),
+            att_name: Some("a.tar.zst"),
+            att_data: Some(&[1, 2, 3]),
             full_body: true,
         })
         .unwrap();
         let att = db.get_attachment(1).unwrap().unwrap();
-        assert_eq!(att.0, "a.zip");
+        assert_eq!(att.0, "a.tar.zst");
         assert_eq!(att.1, vec![1, 2, 3]);
         // 无附件邮件
         db.insert_message(&MailRecord {
@@ -636,8 +673,8 @@ mod query_tests {
             date: None,
             body_text: None,
             body_html: None,
-            zip_name: None,
-            zip_data: None,
+            att_name: None,
+            att_data: None,
             full_body: true,
         })
         .unwrap();

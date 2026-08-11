@@ -80,8 +80,8 @@ pub fn sync_folder(db: &Db, session: &mut ImapSession, folder: &str) -> Result<u
                 date: date.as_deref(),
                 body_text: None,
                 body_html: None,
-                zip_name: None,
-                zip_data: None,
+                att_name: None,
+                att_data: None,
                 full_body: false,
             };
             // 已存在（含历史完整数据）则跳过，只插入新的
@@ -148,17 +148,20 @@ pub fn fetch_full_message(
     };
 
     let msg = parse::parse_mail(raw)?;
-    let (zip_name, zip_data) = match parse::pack(&msg) {
+    let (att_name, att_data) = match parse::pack(&msg) {
         Some(p) => (Some(p.name), Some(p.data)),
         None => (None, None),
     };
+    // 正文 zstd 压缩后入库
+    let body_text = msg.body_text.map(|t| crate::db::compress_text(&t));
+    let body_html = msg.body_html.map(|t| crate::db::compress_text(&t));
     db.update_full_body(
         folder_id,
         uid,
-        msg.body_text.as_deref(),
-        msg.body_html.as_deref(),
-        zip_name.as_deref(),
-        zip_data.as_deref(),
+        body_text.as_deref(),
+        body_html.as_deref(),
+        att_name.as_deref(),
+        att_data.as_deref(),
     )?;
     Ok(true)
 }
