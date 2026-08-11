@@ -74,7 +74,8 @@ fn clean_name(name: &Option<String>) -> String {
     }
 }
 
-/// 解压并列出 tar.zst 内容（Web UI 展示/下载用，测试用）
+/// 解压并列出 tar.zst 内容（测试用）
+#[allow(dead_code)]
 pub fn list_archive(data: &[u8]) -> Vec<String> {
     let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(data))
         .expect("zstd decode");

@@ -24,7 +24,7 @@
         </el-descriptions>
 
         <div v-if="message.has_attachment" class="att">
-          <el-button
+            <el-button
             type="warning"
             plain
             size="small"
@@ -32,7 +32,7 @@
             :href="`/api/messages/${message.id}/attachments`"
           >
             <el-icon><Download /></el-icon>
-            &nbsp;下载附件 ({{ message.zip_name || 'zip' }})
+            &nbsp;下载附件 ({{ message.att_name || 'tar.zst' }})
           </el-button>
         </div>
 

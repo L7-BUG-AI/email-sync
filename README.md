@@ -36,7 +36,7 @@ email-sync --config <path>      # 指定配置文件
 | `GET /api/folders` | 文件夹 + 邮件数 |
 | `GET /api/messages?folder=&search=&page=` | 邮件列表（分页）|
 | `GET /api/messages/:id` | 邮件详情 |
-| `GET /api/messages/:id/attachments` | 附件 zip 下载 |
+| `GET /api/messages/:id/attachments` | 附件 tar.zst 下载 |
 | `GET /api/status` | 数据库统计 |
 | `POST /api/sync` | 触发增量同步 |
 
@@ -115,7 +115,7 @@ sqlite3 ~/.local/share/email-sync/email.db \
 - `imap` (2.x) + `native-tls` — IMAP 拉取（UID 增量跟踪）
 - `mailparse` — RFC822 解析（主题/正文/附件）
 - `rusqlite` (bundled) — SQLite 存储
-- `zip` — 附件打包（deflate）
+- `zstd` (level 1) + `tar` — 附件打包 tar.zst、正文压缩
 - `axum` + `tokio` — Web UI 服务
 
 ## 构建
@@ -124,6 +124,13 @@ sqlite3 ~/.local/share/email-sync/email.db \
 cargo build --release   # 产物 target/release/email-sync（约 2.3MB）
 cargo test              # 32 个单元测试
 ```
+
+## 存储格式（v0.2）
+
+- **附件**：多附件 tar 打包 + zstd level 1 压缩，存 `att_data` BLOB（文件名 `att_name`，如 `attachments-000000.tar.zst`）
+- **正文**：body_text/body_html 用 zstd level 1 压缩后存 BLOB，Web UI 读取时自动解压
+- **DB 工具直查**：正文/附件看到的是压缩二进制（乱码）——看正文用 Web UI，附件下载后 `tar -xf xxx.tar.zst` 解压
+- 压缩等级常量：`src/attach.rs` 的 `ZSTD_LEVEL = 1`（速度优先）
 
 ## 说明
 

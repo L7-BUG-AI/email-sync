@@ -209,7 +209,7 @@ async fn api_attachments(
         .ok_or_else(|| ApiError::msg("该邮件没有附件"))?;
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/zip")
+        .header(header::CONTENT_TYPE, "application/zstd")
         .header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}\"", name),
