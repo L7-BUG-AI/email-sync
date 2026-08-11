@@ -12,6 +12,7 @@ mod db;
 mod imap_client;
 mod parse;
 mod sync;
+mod web;
 
 use anyhow::Result;
 
@@ -26,6 +27,15 @@ fn default_db_path() -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from("email.db")
     }
+}
+
+fn open_db() -> Result<(db::Db, String)> {
+    let db_path = default_db_path();
+    if let Some(dir) = db_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    let db = db::Db::open(db_path.to_str().unwrap())?;
+    Ok((db, db_path.display().to_string()))
 }
 
 fn main() -> Result<()> {
@@ -50,7 +60,7 @@ fn main() -> Result<()> {
                     folder_filter = Some(args[i].clone());
                 }
             }
-            "sync" | "status" => command = args[i].clone(),
+            "sync" | "status" | "serve" => command = args[i].clone(),
             other => {
                 eprintln!("未知参数: {other}");
                 print_usage();
@@ -83,10 +93,20 @@ fn main() -> Result<()> {
             session.logout().ok();
         }
         "status" => {
+            let (db, db_path) = open_db()?;
             let (folders, messages) = db.stats()?;
-            println!("数据库: {}", db_path.display());
+            println!("数据库: {db_path}");
             println!("文件夹数: {folders}");
             println!("邮件总数: {messages}");
+        }
+        "serve" => {
+            let (db, db_path) = open_db()?;
+            let port = std::env::var("EMAIL_SYNC_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8080);
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(web::serve(db, cfg, db_path, port))?;
         }
         _ => unreachable!(),
     }
