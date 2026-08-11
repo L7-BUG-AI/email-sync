@@ -40,6 +40,8 @@ impl Db {
     /// 打开（或创建）数据库并初始化表结构（幂等）
     pub fn open(path: &str) -> Result<Db> {
         let conn = Connection::open(path)?;
+        // 并发写（Web 补拉 vs 后台同步）时等待锁而不是立即报错
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         let db = Db { conn };
         db.init()?;
         Ok(db)
