@@ -18,10 +18,14 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::db::{Db, FolderCount, MessageRow};
+
+/// 嵌入的前端构建产物（web/dist → src/assets/web，build.rs 负责构建）
+static WEB_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/assets/web");
 
 /// 共享状态
 pub struct AppState {
@@ -37,6 +41,7 @@ pub async fn serve(db: Db, cfg: Config, db_path: String, port: u16) -> Result<()
     let state: SharedState = Arc::new(Mutex::new(AppState { db, cfg, db_path }));
     let app = Router::new()
         .route("/", get(index))
+        .route("/assets/:path", get(static_asset))
         .route("/api/folders", get(api_folders))
         .route("/api/messages", get(api_messages))
         .route("/api/messages/:id", get(api_message))
@@ -52,10 +57,45 @@ pub async fn serve(db: Db, cfg: Config, db_path: String, port: u16) -> Result<()
     Ok(())
 }
 
-// ---------- 页面 ----------
+// ---------- 页面与静态资源 ----------
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index() -> Result<Html<&'static str>, ApiError> {
+    let file = WEB_DIR
+        .get_file("index.html")
+        .ok_or_else(|| ApiError::msg("前端未构建（web/ 下 npm run build）"))?;
+    let content = file
+        .contents_utf8()
+        .ok_or_else(|| ApiError::msg("index.html 非 UTF-8"))?;
+    Ok(Html(content))
+}
+
+/// 静态资源：/assets/xxx.js|css|png...
+async fn static_asset(Path(path): Path<String>) -> Result<Response, ApiError> {
+    let rel = format!("assets/{path}");
+    let file = WEB_DIR
+        .get_file(&rel)
+        .ok_or_else(|| ApiError::msg("资源不存在"))?;
+    let data = file.contents();
+    let mime = if rel.ends_with(".js") {
+        "application/javascript"
+    } else if rel.ends_with(".css") {
+        "text/css"
+    } else if rel.ends_with(".png") {
+        "image/png"
+    } else if rel.ends_with(".svg") {
+        "image/svg+xml"
+    } else if rel.ends_with(".woff2") {
+        "font/woff2"
+    } else if rel.ends_with(".json") {
+        "application/json"
+    } else {
+        "application/octet-stream"
+    };
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .body(Body::from(data.to_vec()))
+        .unwrap())
 }
 
 // ---------- API ----------
@@ -239,159 +279,3 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
-
-// ---------- 前端页面 ----------
-
-const INDEX_HTML: &str = r#"<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>email-sync 邮件库</title>
-<style>
-:root { --bg:#0f1115; --panel:#171a21; --border:#262b36; --text:#e6e8ee; --dim:#8b93a5; --accent:#4c8dff; --hover:#1f2430; }
-* { margin:0; padding:0; box-sizing:border-box; }
-body { background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
-#app { display:flex; height:100vh; }
-.sidebar { width:230px; background:var(--panel); border-right:1px solid var(--border); display:flex; flex-direction:column; }
-.brand { padding:16px 18px; font-weight:700; font-size:16px; border-bottom:1px solid var(--border); }
-.brand span { color:var(--accent); }
-.sidebar nav { flex:1; overflow-y:auto; padding:8px; }
-.folder { padding:8px 12px; border-radius:8px; cursor:pointer; display:flex; justify-content:space-between; }
-.folder:hover { background:var(--hover); }
-.folder.active { background:var(--accent); color:#fff; }
-.folder .count { color:var(--dim); font-size:12px; }
-.folder.active .count { color:#fff; }
-.sync-btn { margin:10px; padding:10px; border:0; border-radius:8px; background:var(--accent); color:#fff; font-size:14px; cursor:pointer; }
-.sync-btn:disabled { opacity:.5; cursor:wait; }
-.main { flex:1; display:flex; flex-direction:column; min-width:0; }
-.toolbar { padding:12px 18px; border-bottom:1px solid var(--border); display:flex; gap:12px; align-items:center; }
-.toolbar input { flex:1; padding:8px 12px; border-radius:8px; border:1px solid var(--border); background:var(--panel); color:var(--text); font-size:14px; }
-.toolbar .meta { color:var(--dim); font-size:13px; white-space:nowrap; }
-.list { flex:1; overflow-y:auto; }
-.mail { padding:12px 18px; border-bottom:1px solid var(--border); cursor:pointer; display:flex; gap:12px; align-items:baseline; }
-.mail:hover { background:var(--hover); }
-.mail.selected { background:var(--hover); box-shadow:inset 3px 0 var(--accent); }
-.mail .subject { font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.mail .from { color:var(--dim); width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
-.mail .date { color:var(--dim); font-size:12px; white-space:nowrap; }
-.mail .att { color:var(--accent); font-size:12px; }
-.pager { padding:10px 18px; border-top:1px solid var(--border); display:flex; justify-content:center; gap:12px; align-items:center; color:var(--dim); }
-.pager button { padding:5px 14px; border-radius:6px; border:1px solid var(--border); background:var(--panel); color:var(--text); cursor:pointer; }
-.pager button:disabled { opacity:.4; cursor:default; }
-.detail { flex:1; display:flex; flex-direction:column; min-width:0; }
-.detail-empty { flex:1; display:flex; align-items:center; justify-content:center; color:var(--dim); }
-.detail-head { padding:16px 22px; border-bottom:1px solid var(--border); }
-.detail-head h2 { font-size:17px; margin-bottom:8px; }
-.detail-head .meta { color:var(--dim); font-size:13px; margin-bottom:4px; }
-.detail-head .att-link { display:inline-block; margin-top:8px; color:var(--accent); text-decoration:none; background:var(--hover); padding:6px 12px; border-radius:6px; font-size:13px; }
-.detail-body { flex:1; overflow-y:auto; padding:20px 22px; }
-.detail-body pre { white-space:pre-wrap; word-break:break-word; font:13px/1.7 inherit; }
-.detail-body .html { color:var(--dim); font-size:13px; }
-.toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--accent); color:#fff; padding:10px 20px; border-radius:8px; display:none; font-size:14px; z-index:99; }
-</style>
-</head>
-<body>
-<div id="app">
-  <aside class="sidebar">
-    <div class="brand">📧 email-<span>sync</span></div>
-    <nav id="folders"></nav>
-    <button class="sync-btn" id="syncBtn">🔄 立即同步</button>
-  </aside>
-  <div class="main">
-    <div class="toolbar">
-      <input id="search" placeholder="搜索主题 / 发件人 / 收件人..." />
-      <span class="meta" id="meta"></span>
-    </div>
-    <div class="list" id="mailList"></div>
-    <div class="pager">
-      <button id="prevBtn">‹ 上一页</button>
-      <span id="pageInfo"></span>
-      <button id="nextBtn">下一页 ›</button>
-    </div>
-  </div>
-  <div class="detail" id="detailPane">
-    <div class="detail-empty">← 点击左侧邮件查看详情</div>
-  </div>
-</div>
-<div class="toast" id="toast"></div>
-<script>
-let curFolder = "全部", curSearch = "", curPage = 1, total = 0, pages = 1, selectedId = null;
-
-async function j(url, opts) {
-  const r = await fetch(url, opts);
-  if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.error || r.status); }
-  return r.json();
-}
-function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
-function fmtDate(d) { if (!d) return ""; const m = String(d).match(/(\d{4})[- ](\d{1,2})[- ](\d{1,2})/); return m ? `${m[1]}-${m[2]}-${m[3]}` : String(d).slice(0,16); }
-function toast(msg) { const t = document.getElementById("toast"); t.textContent = msg; t.style.display = "block"; setTimeout(()=>t.style.display="none", 3000); }
-
-async function loadFolders() {
-  const folders = await j("/api/folders");
-  const nav = document.getElementById("folders");
-  const items = [{name:"全部",count:folders.reduce((a,f)=>a+f.count,0)}].concat(folders);
-  nav.innerHTML = items.map(f => `<div class="folder${f.name===curFolder?" active":""}" data-folder="${esc(f.name)}"><span>${esc(f.name)}</span><span class="count">${f.count}</span></div>`).join("");
-  nav.querySelectorAll(".folder").forEach(el => el.onclick = () => { curFolder = el.dataset.folder; curPage = 1; loadFolders(); loadList(); });
-}
-
-async function loadList() {
-  const q = new URLSearchParams({ page: curPage });
-  if (curFolder !== "全部") q.set("folder", curFolder);
-  if (curSearch) q.set("search", curSearch);
-  const data = await j("/api/messages?" + q);
-  total = data.total; pages = data.pages; curPage = data.page;
-  document.getElementById("meta").textContent = `共 ${total} 封`;
-  document.getElementById("pageInfo").textContent = `${curPage} / ${pages}`;
-  document.getElementById("prevBtn").disabled = curPage <= 1;
-  document.getElementById("nextBtn").disabled = curPage >= pages;
-  const list = document.getElementById("mailList");
-  list.innerHTML = data.messages.map(m => `
-    <div class="mail${m.id===selectedId?" selected":""}" data-id="${m.id}">
-      <span class="subject">${esc(m.subject || "(无主题)")}</span>
-      <span class="from">${esc(m.from_addr || "")}</span>
-      <span class="date">${fmtDate(m.date)}</span>
-      ${m.has_attachment ? '<span class="att">📎</span>' : ""}
-    </div>`).join("");
-  list.querySelectorAll(".mail").forEach(el => el.onclick = () => { selectedId = Number(el.dataset.id); loadList(); loadDetail(selectedId); });
-}
-
-async function loadDetail(id) {
-  const m = await j("/api/messages/" + id);
-  const pane = document.getElementById("detailPane");
-  let body = "";
-  if (m.body_text) body = `<pre>${esc(m.body_text)}</pre>`;
-  else if (m.body_html) body = `<div class="html">（HTML 邮件，附件可直接下载）</div>`;
-  else body = '<div class="html">（无正文）</div>';
-  pane.innerHTML = `
-    <div class="detail-head">
-      <h2>${esc(m.subject || "(无主题)")}</h2>
-      <div class="meta">发件人：${esc(m.from_addr || "-")}</div>
-      <div class="meta">收件人：${esc(m.to_addr || "-")}</div>
-      <div class="meta">日期：${esc(m.date || "")} ｜ 文件夹：${esc(m.folder)}</div>
-      ${m.has_attachment ? `<a class="att-link" href="/api/messages/${m.id}/attachments">📎 下载附件 (${esc(m.zip_name || "zip")})</a>` : ""}
-    </div>
-    <div class="detail-body">${body}</div>`;
-}
-
-document.getElementById("search").addEventListener("input", e => {
-  clearTimeout(window._st);
-  window._st = setTimeout(() => { curSearch = e.target.value; curPage = 1; loadList(); }, 400);
-});
-document.getElementById("prevBtn").onclick = () => { if (curPage > 1) { curPage--; loadList(); } };
-document.getElementById("nextBtn").onclick = () => { if (curPage < pages) { curPage++; loadList(); } };
-document.getElementById("syncBtn").onclick = async function() {
-  this.disabled = true; this.textContent = "同步中...";
-  try {
-    const r = await j("/api/sync", { method: "POST" });
-    toast(r.message);
-    await loadFolders(); await loadList();
-  } catch (e) { toast("同步失败：" + e.message); }
-  this.disabled = false; this.textContent = "🔄 立即同步";
-};
-
-loadFolders().catch(e=>toast("加载失败："+e.message));
-loadList().catch(e=>toast("加载失败："+e.message));
-</script>
-</body>
-</html>"#;

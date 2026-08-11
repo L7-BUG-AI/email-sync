@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build"
+    "build": "vite build && rm -rf ../src/assets/web && mkdir -p ../src/assets/web && cp -r dist/* ../src/assets/web/"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",

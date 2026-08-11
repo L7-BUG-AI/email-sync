@@ -9,6 +9,7 @@ use imap_proto::types::Address;
 use crate::db::{Db, MailRecord};
 use crate::imap_client::ImapSession;
 use crate::parse;
+use crate::rfc2047::decode_rfc2047;
 
 /// 同步单个文件夹，返回新增邮件数
 pub fn sync_folder(db: &Db, session: &mut ImapSession, folder: &str) -> Result<u32> {
@@ -62,10 +63,10 @@ pub fn sync_folder(db: &Db, session: &mut ImapSession, folder: &str) -> Result<u
             // 先转成拥有所有权的 String（避免引用临时值）
             let message_id = env
                 .message_id
-                .map(|b| String::from_utf8_lossy(b).into_owned());
+                .map(|b| decode_rfc2047(&String::from_utf8_lossy(b)));
             let subject = env
                 .subject
-                .map(|b| String::from_utf8_lossy(b).into_owned());
+                .map(|b| decode_rfc2047(&String::from_utf8_lossy(b)));
             let date = env.date.map(|b| String::from_utf8_lossy(b).into_owned());
             let from_addr = first_address(&env.from);
             let to_addr = first_address(&env.to);

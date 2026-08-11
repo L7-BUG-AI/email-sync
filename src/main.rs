@@ -9,6 +9,7 @@
 mod attach;
 mod config;
 mod db;
+mod rfc2047;
 mod imap_client;
 mod parse;
 mod sync;

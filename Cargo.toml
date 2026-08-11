@@ -10,6 +10,9 @@ imap-proto = "0.10"
 native-tls = "0.2"
 mailparse = "0.16"
 rusqlite = { version = "0.32", features = ["bundled"] }
+include_dir = "0.7"
+base64 = "0.22"
+encoding_rs = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 anyhow = "1"
 axum = "0.7"
