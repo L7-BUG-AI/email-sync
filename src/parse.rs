@@ -8,6 +8,7 @@ use mailparse::DispositionType;
 use crate::attach::{pack_attachments, Attachment, ZipPack};
 
 /// 解析结果（对应 messages 表字段 + 附件）
+#[allow(dead_code)]
 pub struct ParsedMessage {
     pub message_id: Option<String>,
     pub subject: Option<String>,

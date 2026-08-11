@@ -15,6 +15,7 @@ pub struct FolderState {
 }
 
 /// 邮件记录（入库用）
+#[allow(dead_code)] // 部分字段/方法供后续功能使用
 pub struct MailRecord<'a> {
     pub folder_id: i64,
     pub uid: u32,
@@ -138,6 +139,7 @@ impl Db {
     }
 
     /// 插入一封邮件（UNIQUE(folder_id, uid) 幂等，重复插入忽略）
+    #[allow(dead_code)]
     pub fn insert_message(&self, m: &MailRecord) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO messages

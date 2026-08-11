@@ -115,11 +115,32 @@ async fn api_message(
     Path(id): Path<i64>,
 ) -> Result<Json<MessageRow>, ApiError> {
     let st = state.lock().unwrap();
-    let msg = st
+    let mut msg = st
         .db
         .get_message(id)
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::msg("邮件不存在"))?;
+    // 仅元数据时按需补拉全文
+    if !msg.full_body {
+        let folder = msg.folder.clone();
+        let uid = msg.uid;
+        let cfg = st.cfg.clone();
+        match crate::imap_client::connect(&cfg)
+            .and_then(|mut s| crate::sync::fetch_full_message(&st.db, &mut s, &folder, uid))
+        {
+            Ok(true) => {
+                msg = st
+                    .db
+                    .get_message(id)
+                    .map_err(ApiError::from)?
+                    .ok_or_else(|| ApiError::msg("邮件不存在"))?;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("[warn] 补拉全文失败 id={id}: {e:#}");
+            }
+        }
+    }
     Ok(Json(msg))
 }
 
@@ -128,6 +149,19 @@ async fn api_attachments(
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     let st = state.lock().unwrap();
+    // 仅元数据时先补拉全文（附件在全文里）
+    let msg = st
+        .db
+        .get_message(id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::msg("邮件不存在"))?;
+    if !msg.full_body {
+        let folder = msg.folder.clone();
+        let uid = msg.uid;
+        let cfg = st.cfg.clone();
+        let _ = crate::imap_client::connect(&cfg)
+            .and_then(|mut s| crate::sync::fetch_full_message(&st.db, &mut s, &folder, uid));
+    }
     let (name, data) = st
         .db
         .get_attachment(id)

@@ -4,7 +4,7 @@
 //! （见 fetch_full_message）——首次全量从"下载全部内容"提速到"只拿头部"。
 
 use anyhow::{Context, Result};
-use imap_proto::types::{Address, Envelope};
+use imap_proto::types::Address;
 
 use crate::db::{Db, MailRecord};
 use crate::imap_client::ImapSession;
